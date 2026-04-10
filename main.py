@@ -98,10 +98,11 @@ def get_last_approval_commit(reviews):
 # -------------------------
 def is_merge_allowed(owner, repo, pr_id, head_sha, reviews):
     approvals = [r for r in reviews if r.get("state") == "APPROVED"]
+
     if not approvals:
         return False, "No approvals"
 
-    # берём самый последний approval commit
+    # последний валидный approval
     last_approval = None
     for a in reversed(approvals):
         if a.get("commit_id"):
@@ -109,17 +110,25 @@ def is_merge_allowed(owner, repo, pr_id, head_sha, reviews):
             break
 
     if not last_approval:
-        return False, "No valid approval commit"
+        return False, "No valid approval"
 
-    # diff между approval и HEAD
+    # ВСЕ изменения после approval → HEAD
     files = get_changed_files(owner, repo, last_approval, head_sha)
 
-    # ❗ ВАЖНОЕ ПРАВИЛО:
-    # csproj НЕ инвалидирует
-    # всё остальное инвалидирует
+    if not files:
+        return True, "Approved"
 
-    if any(not f.endswith(".csproj") for f in files):
-        return False, "Re-approval required"
+    # разделяем изменения
+    csproj_changes = [f for f in files if f.endswith(".csproj")]
+    code_changes = [f for f in files if not f.endswith(".csproj")]
+
+    # 💥 КЛЮЧЕВАЯ ЛОГИКА
+    if code_changes:
+        return False, "Code changed after approval"
+
+    # только csproj → всегда ок
+    if csproj_changes:
+        return True, "csproj-only change"
 
     return True, "Approved"
 
