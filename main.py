@@ -27,34 +27,22 @@ def api(method, url, data=None):
 
 
 # -------------------------
-# HELPERS
+# GITEA HELPERS
 # -------------------------
-def extract_files(files):
-    return [f["filename"] for f in files if isinstance(f, dict)]
-
-
-def is_csproj_only(files):
-    return bool(files) and all(f.endswith(".csproj") for f in files)
-
-
-def has_code_changes(files):
-    return any(not f.endswith(".csproj") for f in files)
-
-
 def get_reviews(owner, repo, pr_id):
-    reviews = api(
+    res = api(
         "GET",
         f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/reviews"
     )
-    return reviews or []
+    return res or []
 
 
 def get_files(owner, repo, pr_id):
-    files = api(
+    res = api(
         "GET",
         f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/files"
     )
-    return extract_files(files or [])
+    return [f["filename"] for f in (res or []) if isinstance(f, dict)]
 
 
 def comment(owner, repo, pr_id, text):
@@ -63,6 +51,29 @@ def comment(owner, repo, pr_id, text):
         f"/api/v1/repos/{owner}/{repo}/issues/{pr_id}/comments",
         {"body": text}
     )
+
+
+def set_status(owner, repo, sha, state, description):
+    api(
+        "POST",
+        f"/api/v1/repos/{owner}/{repo}/statuses/{sha}",
+        {
+            "state": state,  # success | failure | pending
+            "context": "pr-approval-gate",
+            "description": description
+        }
+    )
+
+
+# -------------------------
+# LOGIC HELPERS
+# -------------------------
+def is_csproj_only(files):
+    return bool(files) and all(f.endswith(".csproj") for f in files)
+
+
+def has_code_changes(files):
+    return any(not f.endswith(".csproj") for f in files)
 
 
 # -------------------------
@@ -81,11 +92,10 @@ async def webhook(req: Request):
     owner = repo["owner"]["username"]
     name = repo["name"]
     pr_id = pr["number"]
-    head_sha = pr.get("head", {}).get("sha")
+    sha = pr.get("head", {}).get("sha")
 
-    state = PR_STATE.setdefault(pr_id, {
-        "last_notified_sha": None
-    })
+    if not sha:
+        return {"ok": True}
 
     # -------------------------
     # DATA
@@ -97,37 +107,64 @@ async def webhook(req: Request):
 
     has_approvals = len(approvals) >= 1
     csproj_only = is_csproj_only(files)
-    code_changes = has_code_changes(files)
+    code_change = has_code_changes(files)
 
     # -------------------------
-    # RULE 1: no approvals
+    # RULE 1: NO APPROVALS
     # -------------------------
     if not has_approvals:
-        return {"status": "no approvals"}
+        set_status(
+            owner,
+            name,
+            sha,
+            "failure",
+            "No active approvals"
+        )
+        return {"status": "blocked no approvals"}
 
     # -------------------------
-    # RULE 2: csproj only → ALWAYS OK
+    # RULE 2: ONLY CSPROJ → ALWAYS ALLOW
     # -------------------------
     if csproj_only:
-        return {"status": "ok csproj"}
+        set_status(
+            owner,
+            name,
+            sha,
+            "success",
+            "csproj-only change, approvals valid"
+        )
+        return {"status": "allowed csproj"}
 
     # -------------------------
-    # RULE 3: code changes after approval
+    # RULE 3: CODE CHANGE AFTER APPROVAL → HARD BLOCK
     # -------------------------
-    if code_changes:
+    if code_change:
+        set_status(
+            owner,
+            name,
+            sha,
+            "failure",
+            "Code change after approval - re-review required"
+        )
 
-        # 🔥 анти-спам: один коммент на SHA
-        if state["last_notified_sha"] != head_sha:
-
-            comment(
-                owner,
-                name,
-                pr_id,
-                "❌ Обнаружены изменения в коде после аппрува. Требуется повторное ревью. Старые аппрувы считаются невалидными."
-            )
-
-            state["last_notified_sha"] = head_sha
+        comment(
+            owner,
+            name,
+            pr_id,
+            "❌ Изменения в коде после аппрува. Мерж заблокирован до повторного ревью."
+        )
 
         return {"status": "blocked code change"}
+
+    # -------------------------
+    # DEFAULT SAFE STATE
+    # -------------------------
+    set_status(
+        owner,
+        name,
+        sha,
+        "success",
+        "approved and unchanged"
+    )
 
     return {"status": "ok"}
