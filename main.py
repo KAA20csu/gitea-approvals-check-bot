@@ -56,44 +56,48 @@ def set_status(owner, repo, sha, state, desc):
         }
     )
 
+def get_commits(owner, repo, pr_id):
+    res = api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/commits")
+    return [c["sha"] for c in (res or []) if isinstance(c, dict)]
 
-def has_valid_approval(owner, repo, head_sha, reviews):
-    approvals = [r for r in reviews if r.get("state") == "APPROVED"]
 
-    if not approvals:
-        return False
+def get_last_code_change_commit(owner, repo, commits, head_sha):
+    last_code_sha = None
 
-    # берём ВСЕ commit_id аппрувов
-    approval_shas = set(a.get("commit_id") for a in approvals if a.get("commit_id"))
-
-    # получаем всю историю PR
-    commits = api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{repo}/commits")
-    commits = [c["sha"] for c in commits or [] if isinstance(c, dict)]
-
-    last_bad_change_index = -1
-
-    # ищем последний "code change commit"
-    for i in range(len(commits)):
-        sha = commits[i]
-
+    for sha in commits:
         files = get_changed_files_between(owner, repo, sha, head_sha)
 
         if any(not f.endswith(".csproj") for f in files):
-            last_bad_change_index = i
+            last_code_sha = sha
 
-    # если code changes были после всех аппрувов → блок
-    for i in range(last_bad_change_index + 1, len(commits)):
-        sha = commits[i]
+    return last_code_sha
 
-        if sha in approval_shas:
-            return True
+def get_last_approval_commit(reviews):
+    approvals = [r for r in reviews if r.get("state") == "APPROVED"]
 
-    # если code changes есть и нет аппрува после них → блок
-    if last_bad_change_index != -1:
+    if not approvals:
+        return None
+
+    # берём самый “поздний” по появлению
+    return approvals[-1].get("commit_id")
+
+
+def has_valid_approval(owner, repo, pr_id, head_sha, reviews):
+    commits = get_commits(owner, repo, pr_id)
+
+    last_code = get_last_code_change_commit(owner, repo, commits, head_sha)
+    last_approval = get_last_approval_commit(reviews)
+
+    # нет аппрува вообще
+    if not last_approval:
         return False
 
-    # если вообще нет code changes → достаточно любого аппрува
-    return True
+    # если code вообще не было → ок
+    if not last_code:
+        return True
+
+    # 🔥 КЛЮЧЕВОЕ ПРАВИЛО
+    return last_approval >= last_code
 
 
 # -------------------------
