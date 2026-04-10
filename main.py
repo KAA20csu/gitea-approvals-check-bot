@@ -7,16 +7,9 @@ app = FastAPI()
 GITEA_URL = os.getenv("GITEA_URL").rstrip("/")
 TOKEN = os.getenv("GITEA_TOKEN")
 
-
-# -------------------------
-# STATE STORAGE (in-memory)
-# -------------------------
 PR_STATE = {}
 
 
-# -------------------------
-# API
-# -------------------------
 def api(method, url, data=None):
     r = requests.request(
         method,
@@ -30,27 +23,8 @@ def api(method, url, data=None):
         return {}
 
 
-# -------------------------
-# HELPERS
-# -------------------------
 def extract_files(files):
     return [f["filename"] for f in files if isinstance(f, dict)]
-
-
-def get_approvals(owner, repo, pr_id):
-    reviews = api(
-        "GET",
-        f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/reviews"
-    )
-    return [r for r in reviews if r.get("state") == "APPROVED"]
-
-
-def get_files(owner, repo, pr_id):
-    files = api(
-        "GET",
-        f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/files"
-    )
-    return extract_files(files)
 
 
 def comment(owner, repo, pr_id, text):
@@ -61,36 +35,44 @@ def comment(owner, repo, pr_id, text):
     )
 
 
-def label(owner, repo, pr_id, lbl):
-    api(
-        "POST",
-        f"/api/v1/repos/{owner}/{repo}/issues/{pr_id}/labels",
-        {"labels": [lbl]}
+def get_reviews(owner, repo, pr_id):
+    return api(
+        "GET",
+        f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/reviews"
     )
 
 
-def block_state(state):
-    state["blocked"] = True
+def get_files(owner, repo, pr_id):
+    files = api(
+        "GET",
+        f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/files"
+    )
+    return extract_files(files)
 
 
-def invalidate(state):
-    state["invalidated"] = True
-
-
-# -------------------------
-# LOGIC HELPERS
-# -------------------------
 def is_csproj_only(files):
     return bool(files) and all(f.endswith(".csproj") for f in files)
 
 
-def has_non_csproj(files):
+def has_code_change(files):
     return any(not f.endswith(".csproj") for f in files)
 
 
-# -------------------------
-# WEBHOOK
-# -------------------------
+def invalidate_all_approvals(owner, repo, pr_id):
+    reviews = get_reviews(owner, repo, pr_id)
+
+    for r in reviews:
+        if r.get("state") == "APPROVED":
+            api(
+                "POST",
+                f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/reviews",
+                {
+                    "event": "REQUEST_CHANGES",
+                    "body": "Auto invalidated due to code changes after approval"
+                }
+            )
+
+
 @app.post("/webhook")
 async def webhook(req: Request):
     payload = await req.json()
@@ -105,81 +87,40 @@ async def webhook(req: Request):
     name = repo["name"]
     pr_id = pr["number"]
 
-    # -------------------------
-    # STATE
-    # -------------------------
-    state = PR_STATE.setdefault(pr_id, {
-        "last_comment_type": None,
-        "blocked": False,
-        "invalidated": False
-    })
+    reviews = get_reviews(owner, name, pr_id)
+    approvals = [r for r in reviews if r.get("state") == "APPROVED"]
 
-    # -------------------------
-    # DATA
-    # -------------------------
-    approvals = get_approvals(owner, name, pr_id)
     files = get_files(owner, name, pr_id)
-
-    print(f"PR #{pr_id}")
-    print("approvals:", len(approvals))
-    print("files:", files)
 
     has_approvals = len(approvals) >= 1
     csproj_only = is_csproj_only(files)
-    code_changes = has_non_csproj(files)
+    code_change = has_code_change(files)
 
     # -------------------------
-    # RULE 1: NO APPROVALS
+    # CASE 1: no approvals → ok but blocked by policy
     # -------------------------
     if not has_approvals:
-        if state["last_comment_type"] != "no-approval":
-            comment(
-                owner,
-                name,
-                pr_id,
-                "❌ Нет активных аппрувов. Мерж запрещён."
-            )
-            state["last_comment_type"] = "no-approval"
-
-        block_state(state)
-        return {"status": "blocked no approvals"}
+        return {"status": "no approvals"}
 
     # -------------------------
-    # RULE 2: ONLY CSPROJ
+    # CASE 2: csproj only → ALWAYS OK
     # -------------------------
     if csproj_only:
-        if state["last_comment_type"] != "csproj":
-            comment(
-                owner,
-                name,
-                pr_id,
-                "📦 Изменения только в .csproj. Аппрувы остаются валидными. Мерж разрешён."
-            )
-            state["last_comment_type"] = "csproj"
-
-        state["blocked"] = False
-        return {"status": "csproj allowed"}
+        return {"status": "ok csproj only"}
 
     # -------------------------
-    # RULE 3: CODE CHANGES
+    # CASE 3: code change after approvals
     # -------------------------
-    if code_changes:
-        if state["last_comment_type"] != "code":
+    if code_change:
+        comment(
+            owner,
+            name,
+            pr_id,
+            "❌ Обнаружены изменения в коде после аппрува. Аппрувы аннулированы, требуется повторное ревью."
+        )
 
-            comment(
-                owner,
-                name,
-                pr_id,
-                "⚠️ Обнаружены изменения в коде после/во время аппрува. Требуется повторное ревью."
-            )
+        invalidate_all_approvals(owner, name, pr_id)
 
-            label(owner, name, pr_id, "re-review-required")
-
-            invalidate(state)
-            block_state(state)
-
-            state["last_comment_type"] = "code"
-
-        return {"status": "code review required"}
+        return {"status": "blocked code changed"}
 
     return {"status": "ok"}
