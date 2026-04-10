@@ -25,77 +25,73 @@ def api(method, url, data=None):
 
 
 # -------------------------
-# HELPERS
+# DATA HELPERS
 # -------------------------
 def get_reviews(owner, repo, pr_id):
     return api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/reviews") or []
 
 
-def get_changed_files_between(owner, repo, base, head):
-    res = api(
-        "GET",
-        f"/api/v1/repos/{owner}/{repo}/compare/{base}...{head}"
-    )
+def get_approvals(reviews):
+    return [r for r in reviews if r.get("state") == "APPROVED"]
+
+
+def get_pr_commits(owner, repo, pr_id):
+    res = api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/commits")
+    return [c["sha"] for c in (res or []) if isinstance(c, dict)]
+
+
+def get_changed_files(owner, repo, base, head):
+    res = api("GET", f"/api/v1/repos/{owner}/{repo}/compare/{base}...{head}")
     files = res.get("files", [])
     return [f["filename"] for f in files if isinstance(f, dict)]
 
 
+# -------------------------
+# RULES
+# -------------------------
 def only_csproj(files):
-    return files and all(f.endswith(".csproj") for f in files)
+    return bool(files) and all(f.endswith(".csproj") for f in files)
 
 
-def set_status(owner, repo, sha, state, desc):
-    api(
-        "POST",
-        f"/api/v1/repos/{owner}/{repo}/statuses/{sha}",
-        {
-            "state": state,  # success | failure | pending
-            "context": "pr-approval-gate",
-            "description": desc
-        }
-    )
+def has_code_changes(files):
+    return any(not f.endswith(".csproj") for f in files)
+
+
+def has_any_approval(reviews):
+    return len(get_approvals(reviews)) > 0
 
 
 # -------------------------
 # CORE LOGIC
 # -------------------------
-def get_last_approval(reviews):
-    approved = [r for r in reviews if r.get("state") == "APPROVED"]
+def is_merge_allowed(owner, repo, pr_id, head_sha, reviews):
+    if not has_any_approval(reviews):
+        return False, "No approvals"
 
-    if not approved:
-        return None
+    commits = get_pr_commits(owner, repo, pr_id)
 
-    approved.sort(key=lambda x: x.get("submitted_at", ""))
-    return approved[-1]
+    # идём от HEAD назад по коммитам PR
+    for i in range(len(commits) - 1, -1, -1):
+        commit_sha = commits[i]
 
+        files = get_changed_files(owner, repo, commit_sha, head_sha)
 
-def is_last_approval_valid(owner, repo, head_sha, reviews):
-    last = get_last_approval(reviews)
+        # если нашли реальный code change → ищем аппрув после него
+        if has_code_changes(files):
+            # проверяем: есть ли аппрув после этого изменения
+            approvals = get_approvals(reviews)
 
-    if not last:
-        return False
+            valid = any(
+                a.get("commit_id") in commits[i+1:]
+                for a in approvals
+            )
 
-    approval_sha = last.get("commit_id")
+            if not valid:
+                return False, "Code changed → re-approval required"
 
-    if not approval_sha:
-        return False
+        # csproj игнорим полностью
 
-    # если аппрув прямо на текущий коммит
-    if approval_sha == head_sha:
-        return True
-
-    changed_files = get_changed_files_between(
-        owner,
-        repo,
-        approval_sha,
-        head_sha
-    )
-
-    # если после аппрува менялся только csproj → НЕ инвалидируем
-    if only_csproj(changed_files):
-        return True
-
-    return False
+    return True, "Approved"
 
 
 # -------------------------
@@ -121,22 +117,18 @@ async def webhook(req: Request):
 
     reviews = get_reviews(owner, name, pr_id)
 
-    # -------------------------
-    # ГЛАВНАЯ ПРОВЕРКА
-    # -------------------------
-    is_valid = is_last_approval_valid(owner, name, head_sha, reviews)
+    allowed, desc = is_merge_allowed(owner, name, pr_id, head_sha, reviews)
 
-    if is_valid:
-        set_status(owner, name, head_sha, "success", "Approved")
-        return {"status": "approved"}
+    state = "success" if allowed else "failure"
 
-    else:
-        set_status(
-            owner,
-            name,
-            head_sha,
-            "failure",
-            "Re-approval required"
-        )
+    api(
+        "POST",
+        f"/api/v1/repos/{owner}/{repo}/statuses/{head_sha}",
+        {
+            "state": state,
+            "context": "pr-approval-gate",
+            "description": desc
+        }
+    )
 
-        return {"status": "blocked"}
+    return {"status": state, "desc": desc}
