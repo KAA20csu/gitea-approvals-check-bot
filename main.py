@@ -97,27 +97,31 @@ def get_last_approval_commit(reviews):
 # CORE RULE ENGINE
 # -------------------------
 def is_merge_allowed(owner, repo, pr_id, head_sha, reviews):
-    commits = get_commits(owner, repo, pr_id)
-
-    last_code = get_last_code_change_commit(owner, repo, commits, head_sha)
-    last_approval = get_last_approval_commit(reviews)
-
-    # нет аппрува вообще
-    if not last_approval:
+    approvals = [r for r in reviews if r.get("state") == "APPROVED"]
+    if not approvals:
         return False, "No approvals"
 
-    # если code изменений не было
-    if not last_code:
-        return True, "Approved"
+    # берём самый последний approval commit
+    last_approval = None
+    for a in reversed(approvals):
+        if a.get("commit_id"):
+            last_approval = a["commit_id"]
+            break
 
-    # если последний аппрув позже code change → OK
-    try:
-        if commits.index(last_approval) > commits.index(last_code):
-            return True, "Approved after code change"
-    except ValueError:
-        return False, "Invalid commit history"
+    if not last_approval:
+        return False, "No valid approval commit"
 
-    return False, "Re-approval required"
+    # diff между approval и HEAD
+    files = get_changed_files(owner, repo, last_approval, head_sha)
+
+    # ❗ ВАЖНОЕ ПРАВИЛО:
+    # csproj НЕ инвалидирует
+    # всё остальное инвалидирует
+
+    if any(not f.endswith(".csproj") for f in files):
+        return False, "Re-approval required"
+
+    return True, "Approved"
 
 
 # -------------------------
