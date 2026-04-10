@@ -28,22 +28,11 @@ def get_reviews(owner, repo, pr_id):
     return api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/reviews") or []
 
 
-def get_last_approval(reviews):
-    approved = [r for r in reviews if r.get("state") == "APPROVED"]
-    if not approved:
-        return None
-
-    # берём самый свежий аппрув
-    approved.sort(key=lambda x: x.get("submitted_at", ""))
-    return approved[-1]
-
-
 def get_changed_files_between(owner, repo, base, head):
     res = api(
         "GET",
         f"/api/v1/repos/{owner}/{repo}/compare/{base}...{head}"
     )
-
     files = res.get("files", [])
     return [f["filename"] for f in files if isinstance(f, dict)]
 
@@ -68,13 +57,31 @@ def set_status(owner, repo, sha, state, desc):
     )
 
 
-def request_rereview(owner, repo, pr_id):
-    # лайтовый способ — просто комментарий (без спама можно улучшить)
-    api(
-        "POST",
-        f"/api/v1/repos/{owner}/{repo}/issues/{pr_id}/comments",
-        {"body": "🔄 Требуется повторное ревью после изменений в коде"}
-    )
+def has_valid_approval(owner, repo, head_sha, reviews):
+    approvals = [r for r in reviews if r.get("state") == "APPROVED"]
+
+    for a in approvals:
+        approval_sha = a.get("commit_id")
+
+        if not approval_sha:
+            continue
+
+        # если аппрув прямо на текущий коммит — идеально
+        if approval_sha == head_sha:
+            return True
+
+        changed_files = get_changed_files_between(
+            owner,
+            repo,
+            approval_sha,
+            head_sha
+        )
+
+        # если после аппрува менялись только csproj → аппрув валиден
+        if only_csproj(changed_files):
+            return True
+
+    return False
 
 
 # -------------------------
@@ -99,57 +106,23 @@ async def webhook(req: Request):
         return {"ok": True}
 
     reviews = get_reviews(owner, name, pr_id)
-    last_approval = get_last_approval(reviews)
 
     # -------------------------
-    # НЕТ АППРУВА
+    # ГЛАВНАЯ ПРОВЕРКА
     # -------------------------
-    if not last_approval:
-        set_status(owner, name, head_sha, "failure", "No approvals")
-        return {"status": "no approvals"}
+    valid = has_valid_approval(owner, name, head_sha, reviews)
 
-    approval_sha = last_approval.get("commit_id")
-
-    # -------------------------
-    # ЕСЛИ SHA СОВПАДАЕТ → ВСЁ ОК
-    # -------------------------
-    if approval_sha == head_sha:
+    if valid:
         set_status(owner, name, head_sha, "success", "Approved")
         return {"status": "approved"}
 
-    # -------------------------
-    # СМОТРИМ ЧТО ИЗМЕНИЛОСЬ ПОСЛЕ АППРУВА
-    # -------------------------
-    changed_files = get_changed_files_between(
-        owner,
-        name,
-        approval_sha,
-        head_sha
-    )
-
-    # -------------------------
-    # ТОЛЬКО CSPROJ → ОК
-    # -------------------------
-    if only_csproj(changed_files):
-        set_status(owner, name, head_sha, "success", "Only csproj changed")
-        return {"status": "csproj ok"}
-
-    # -------------------------
-    # ЕСТЬ CODE CHANGE → БЛОК
-    # -------------------------
-    if has_real_code_changes(changed_files):
+    else:
         set_status(
             owner,
             name,
             head_sha,
             "failure",
-            "Code changed after approval"
+            "Re-approval required"
         )
 
-        request_rereview(owner, name, pr_id)
-
-        return {"status": "re-review required"}
-
-    # fallback
-    set_status(owner, name, head_sha, "success", "Approved")
-    return {"status": "ok"}
+        return {"status": "blocked"}
