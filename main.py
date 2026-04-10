@@ -1,3 +1,73 @@
+from fastapi import FastAPI, Request
+import os
+import requests
+
+app = FastAPI()
+
+GITEA_URL = os.getenv("GITEA_URL").rstrip("/")
+TOKEN = os.getenv("GITEA_TOKEN")
+
+PR_STATE = {}
+
+
+# -------------------------
+# API
+# -------------------------
+def api(method, url, data=None):
+    r = requests.request(
+        method,
+        f"{GITEA_URL}{url}",
+        headers={"Authorization": f"token {TOKEN}"},
+        json=data
+    )
+    try:
+        return r.json()
+    except:
+        return {}
+
+
+# -------------------------
+# HELPERS
+# -------------------------
+def extract_files(files):
+    return [f["filename"] for f in files if isinstance(f, dict)]
+
+
+def is_csproj_only(files):
+    return bool(files) and all(f.endswith(".csproj") for f in files)
+
+
+def has_code_changes(files):
+    return any(not f.endswith(".csproj") for f in files)
+
+
+def get_reviews(owner, repo, pr_id):
+    reviews = api(
+        "GET",
+        f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/reviews"
+    )
+    return reviews or []
+
+
+def get_files(owner, repo, pr_id):
+    files = api(
+        "GET",
+        f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/files"
+    )
+    return extract_files(files or [])
+
+
+def comment(owner, repo, pr_id, text):
+    api(
+        "POST",
+        f"/api/v1/repos/{owner}/{repo}/issues/{pr_id}/comments",
+        {"body": text}
+    )
+
+
+# -------------------------
+# WEBHOOK
+# -------------------------
 @app.post("/webhook")
 async def webhook(req: Request):
     payload = await req.json()
@@ -14,65 +84,50 @@ async def webhook(req: Request):
     head_sha = pr.get("head", {}).get("sha")
 
     state = PR_STATE.setdefault(pr_id, {
-        "last_comment_type": None,
-        "last_comment_sha": None,
-        "last_approved_sha": None
+        "last_notified_sha": None
     })
 
+    # -------------------------
+    # DATA
+    # -------------------------
     reviews = get_reviews(owner, name, pr_id)
     approvals = [r for r in reviews if r.get("state") == "APPROVED"]
 
     files = get_files(owner, name, pr_id)
 
-    csproj_only = is_csproj_only(files)
-    code_change = has_code_change(files)
-
     has_approvals = len(approvals) >= 1
+    csproj_only = is_csproj_only(files)
+    code_changes = has_code_changes(files)
 
-    # ----------------------------------------
-    # 1. нет аппрувов → просто выходим
-    # ----------------------------------------
+    # -------------------------
+    # RULE 1: no approvals
+    # -------------------------
     if not has_approvals:
         return {"status": "no approvals"}
 
-    # ----------------------------------------
-    # 2. csproj-only → фиксируем approval SHA
-    # ----------------------------------------
+    # -------------------------
+    # RULE 2: csproj only → ALWAYS OK
+    # -------------------------
     if csproj_only:
-        state["last_approved_sha"] = head_sha
-
-        # анти-спам
-        if state["last_comment_sha"] != head_sha or state["last_comment_type"] != "csproj":
-            comment(owner, name, pr_id,
-                    "📦 Только .csproj изменения — аппрувы валидны, мерж разрешён.")
-
-            state["last_comment_sha"] = head_sha
-            state["last_comment_type"] = "csproj"
-
         return {"status": "ok csproj"}
 
-    # ----------------------------------------
-    # 3. code change
-    # ----------------------------------------
-    if code_change:
+    # -------------------------
+    # RULE 3: code changes after approval
+    # -------------------------
+    if code_changes:
 
-        # 👉 если уже комментировали на этом SHA — ничего не делаем
-        if state["last_comment_sha"] == head_sha and state["last_comment_type"] == "code":
-            return {"status": "already handled"}
+        # 🔥 анти-спам: один коммент на SHA
+        if state["last_notified_sha"] != head_sha:
 
-        comment(
-            owner,
-            name,
-            pr_id,
-            "❌ Обнаружены изменения в коде после аппрува. Требуется повторное ревью. Старые аппрувы больше невалидны."
-        )
+            comment(
+                owner,
+                name,
+                pr_id,
+                "❌ Обнаружены изменения в коде после аппрува. Требуется повторное ревью. Старые аппрувы считаются невалидными."
+            )
 
-        state["last_comment_sha"] = head_sha
-        state["last_comment_type"] = "code"
+            state["last_notified_sha"] = head_sha
 
-        # ❗ ВАЖНО: вместо "invalidate approvals" делаем это логически
-        state["last_approved_sha"] = None
-
-        return {"status": "code invalidated"}
+        return {"status": "blocked code change"}
 
     return {"status": "ok"}
