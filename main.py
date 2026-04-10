@@ -8,9 +8,6 @@ GITEA_URL = os.getenv("GITEA_URL").rstrip("/")
 TOKEN = os.getenv("GITEA_TOKEN")
 
 
-# -------------------------
-# API
-# -------------------------
 def api(method, url, data=None):
     r = requests.request(
         method,
@@ -25,73 +22,78 @@ def api(method, url, data=None):
 
 
 # -------------------------
-# DATA HELPERS
+# HELPERS
 # -------------------------
 def get_reviews(owner, repo, pr_id):
     return api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/reviews") or []
 
 
-def get_approvals(reviews):
-    return [r for r in reviews if r.get("state") == "APPROVED"]
-
-
-def get_pr_commits(owner, repo, pr_id):
-    res = api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/commits")
-    return [c["sha"] for c in (res or []) if isinstance(c, dict)]
-
-
-def get_changed_files(owner, repo, base, head):
-    res = api("GET", f"/api/v1/repos/{owner}/{repo}/compare/{base}...{head}")
+def get_changed_files_between(owner, repo, base, head):
+    res = api(
+        "GET",
+        f"/api/v1/repos/{owner}/{repo}/compare/{base}...{head}"
+    )
     files = res.get("files", [])
     return [f["filename"] for f in files if isinstance(f, dict)]
 
 
-# -------------------------
-# RULES
-# -------------------------
 def only_csproj(files):
-    return bool(files) and all(f.endswith(".csproj") for f in files)
+    return files and all(f.endswith(".csproj") for f in files)
 
 
-def has_code_changes(files):
+def has_real_code_changes(files):
     return any(not f.endswith(".csproj") for f in files)
 
 
-def has_any_approval(reviews):
-    return len(get_approvals(reviews)) > 0
+def set_status(owner, repo, sha, state, desc):
+    api(
+        "POST",
+        f"/api/v1/repos/{owner}/{repo}/statuses/{sha}",
+        {
+            "state": state,
+            "context": "pr-approval-gate",
+            "description": desc
+        }
+    )
 
 
-# -------------------------
-# CORE LOGIC
-# -------------------------
-def is_merge_allowed(owner, repo, pr_id, head_sha, reviews):
-    if not has_any_approval(reviews):
-        return False, "No approvals"
+def has_valid_approval(owner, repo, head_sha, reviews):
+    approvals = [r for r in reviews if r.get("state") == "APPROVED"]
 
-    commits = get_pr_commits(owner, repo, pr_id)
+    if not approvals:
+        return False
 
-    # идём от HEAD назад по коммитам PR
-    for i in range(len(commits) - 1, -1, -1):
-        commit_sha = commits[i]
+    # берём ВСЕ commit_id аппрувов
+    approval_shas = set(a.get("commit_id") for a in approvals if a.get("commit_id"))
 
-        files = get_changed_files(owner, repo, commit_sha, head_sha)
+    # получаем всю историю PR
+    commits = api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{repo}/commits")
+    commits = [c["sha"] for c in commits or [] if isinstance(c, dict)]
 
-        # если нашли реальный code change → ищем аппрув после него
-        if has_code_changes(files):
-            # проверяем: есть ли аппрув после этого изменения
-            approvals = get_approvals(reviews)
+    last_bad_change_index = -1
 
-            valid = any(
-                a.get("commit_id") in commits[i+1:]
-                for a in approvals
-            )
+    # ищем последний "code change commit"
+    for i in range(len(commits)):
+        sha = commits[i]
 
-            if not valid:
-                return False, "Code changed → re-approval required"
+        files = get_changed_files_between(owner, repo, sha, head_sha)
 
-        # csproj игнорим полностью
+        if any(not f.endswith(".csproj") for f in files):
+            last_bad_change_index = i
 
-    return True, "Approved"
+    # если code changes были после всех аппрувов → блок
+    for i in range(last_bad_change_index + 1, len(commits)):
+        sha = commits[i]
+
+        if sha in approval_shas:
+            return True
+
+    # если code changes есть и нет аппрува после них → блок
+    if last_bad_change_index != -1:
+        return False
+
+    # если вообще нет code changes → достаточно любого аппрува
+    return True
 
 
 # -------------------------
@@ -117,18 +119,22 @@ async def webhook(req: Request):
 
     reviews = get_reviews(owner, name, pr_id)
 
-    allowed, desc = is_merge_allowed(owner, name, pr_id, head_sha, reviews)
+    # -------------------------
+    # ГЛАВНАЯ ПРОВЕРКА
+    # -------------------------
+    valid = has_valid_approval(owner, name, head_sha, reviews)
 
-    state = "success" if allowed else "failure"
+    if valid:
+        set_status(owner, name, head_sha, "success", "Approved")
+        return {"status": "approved"}
 
-    api(
-        "POST",
-        f"/api/v1/repos/{owner}/{repo}/statuses/{head_sha}",
-        {
-            "state": state,
-            "context": "pr-approval-gate",
-            "description": desc
-        }
-    )
+    else:
+        set_status(
+            owner,
+            name,
+            head_sha,
+            "failure",
+            "Re-approval required"
+        )
 
-    return {"status": state, "desc": desc}
+        return {"status": "blocked"}
