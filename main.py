@@ -25,21 +25,15 @@ def api(method, url, data=None):
 
 
 # -------------------------
-# GITEA HELPERS
+# HELPERS
 # -------------------------
 def get_reviews(owner, repo, pr_id):
-    res = api(
-        "GET",
-        f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/reviews"
-    )
+    res = api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/reviews")
     return res or []
 
 
 def get_files(owner, repo, pr_id):
-    res = api(
-        "GET",
-        f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/files"
-    )
+    res = api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/files")
     return [f["filename"] for f in (res or []) if isinstance(f, dict)]
 
 
@@ -56,7 +50,7 @@ def set_status(owner, repo, sha, state, desc):
 
 
 # -------------------------
-# LOGIC HELPERS
+# LOGIC
 # -------------------------
 def is_csproj_only(files):
     return bool(files) and all(f.endswith(".csproj") for f in files)
@@ -66,21 +60,33 @@ def has_code_changes(files):
     return any(not f.endswith(".csproj") for f in files)
 
 
+# 🔥 ВАЖНО: валидируем аппрувы только для текущего HEAD
+def get_valid_approvals(reviews, head_sha):
+    valid = []
+
+    for r in reviews:
+        if r.get("state") != "APPROVED":
+            continue
+
+        # ключевая магия:
+        # аппрув должен быть именно на текущий commit
+        if r.get("commit_id") == head_sha:
+            valid.append(r)
+
+    return valid
+
+
 def compute_gate(has_approvals, csproj_only, code_change):
-    """
-    ЕДИНСТВЕННОЕ место принятия решения
-    (никаких state-грязных багов больше)
-    """
     if not has_approvals:
-        return "failure", "No approvals"
+        return "failure", "No valid approvals"
 
     if csproj_only:
         return "success", "csproj-only change"
 
     if code_change:
-        return "failure", "Code changed after approval"
+        return "failure", "Code change requires re-approval"
 
-    return "success", "approved state"
+    return "success", "approved"
 
 
 # -------------------------
@@ -108,29 +114,27 @@ async def webhook(req: Request):
     # DATA
     # -------------------------
     reviews = get_reviews(owner, name, pr_id)
-    approvals = [r for r in reviews if r.get("state") == "APPROVED"]
-
     files = get_files(owner, name, pr_id)
 
-    has_approvals = len(approvals) >= 1
+    valid_approvals = get_valid_approvals(reviews, sha)
+
+    has_approvals = len(valid_approvals) >= 1
     csproj_only = is_csproj_only(files)
     code_change = has_code_changes(files)
 
     # -------------------------
-    # COMPUTE STATE (NO CACHE, NO SPAM, NO STUCK STATE)
+    # FINAL DECISION (stateless)
     # -------------------------
-    state_value, desc = compute_gate(
+    state, desc = compute_gate(
         has_approvals,
         csproj_only,
         code_change
     )
 
-    # -------------------------
-    # APPLY STATUS (idempotent by Gitea context+sha)
-    # -------------------------
-    set_status(owner, name, sha, state_value, desc)
+    set_status(owner, name, sha, state, desc)
 
     return {
-        "status": state_value,
-        "desc": desc
+        "state": state,
+        "desc": desc,
+        "valid_approvals": len(valid_approvals)
     }
