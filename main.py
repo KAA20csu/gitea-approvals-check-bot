@@ -7,9 +7,14 @@ app = FastAPI()
 GITEA_URL = os.getenv("GITEA_URL").rstrip("/")
 TOKEN = os.getenv("GITEA_TOKEN")
 
+# -------------------------
+# STATE STORAGE (in-memory)
+# -------------------------
+PR_STATE = {}
+
 
 # -------------------------
-# API WRAPPER
+# API
 # -------------------------
 def api(method, url, data=None):
     r = requests.request(
@@ -18,9 +23,6 @@ def api(method, url, data=None):
         headers={"Authorization": f"token {TOKEN}"},
         json=data
     )
-
-    print(f"➡️ {method} {url} -> {r.status_code}")
-
     try:
         return r.json()
     except:
@@ -30,9 +32,12 @@ def api(method, url, data=None):
 # -------------------------
 # HELPERS
 # -------------------------
-def extract_files(owner, repo, pr_id):
-    files = api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/files")
-    return [f.get("filename") for f in files if isinstance(f, dict)]
+def extract_files(files):
+    return [f["filename"] for f in files if isinstance(f, dict)]
+
+
+def is_csproj_only(files):
+    return files and all(f.endswith(".csproj") for f in files)
 
 
 def get_approvals(owner, repo, pr_id):
@@ -40,24 +45,17 @@ def get_approvals(owner, repo, pr_id):
     return [r for r in reviews if r.get("state") == "APPROVED"]
 
 
-def is_csproj_only(files):
-    return files and all(f.endswith(".csproj") for f in files)
+def get_files(owner, repo, pr_id):
+    files = api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/files")
+    return extract_files(files)
 
 
 def comment(owner, repo, pr_id, text):
-    api(
-        "POST",
-        f"/api/v1/repos/{owner}/{repo}/issues/{pr_id}/comments",
-        {"body": text}
-    )
+    api("POST", f"/api/v1/repos/{owner}/{repo}/issues/{pr_id}/comments", {"body": text})
 
 
-def add_label(owner, repo, pr_id, label):
-    api(
-        "POST",
-        f"/api/v1/repos/{owner}/{repo}/issues/{pr_id}/labels",
-        {"labels": [label]}
-    )
+def label(owner, repo, pr_id, lbl):
+    api("POST", f"/api/v1/repos/{owner}/{repo}/issues/{pr_id}/labels", {"labels": [lbl]})
 
 
 # -------------------------
@@ -67,51 +65,88 @@ def add_label(owner, repo, pr_id, label):
 async def webhook(req: Request):
     payload = await req.json()
 
-    print("\n====================")
-    print("🔥 WEBHOOK RECEIVED")
-    print("RAW ACTION:", payload.get("action"))
-
     pr = payload.get("pull_request")
     repo = payload.get("repository")
 
-    # ❗ CRITICAL FIX: не фильтруем action вообще
     if not pr or not repo:
-        print("⛔ Not a PR event")
         return {"ok": True}
 
     owner = repo["owner"]["username"]
     name = repo["name"]
     pr_id = pr["number"]
 
-    print(f"📌 PR: {owner}/{name} #{pr_id}")
+    # -------------------------
+    # commit id (PR head)
+    # -------------------------
+    commit_id = pr.get("head", {}).get("sha")
+
+    if not commit_id:
+        return {"ok": True}
 
     # -------------------------
-    # APPROVALS
+    # INIT STATE
+    # -------------------------
+    state = PR_STATE.setdefault(pr_id, {
+        "last_commit": None,
+        "processed": set(),
+        "invalidated": False
+    })
+
+    # -------------------------
+    # DEDUP
+    # -------------------------
+    if commit_id in state["processed"]:
+        print("⛔ Already processed commit")
+        return {"ok": True}
+
+    state["processed"].add(commit_id)
+    state["last_commit"] = commit_id
+
+    print(f"📌 PR #{pr_id} commit {commit_id}")
+
+    # -------------------------
+    # DATA
     # -------------------------
     approvals = get_approvals(owner, name, pr_id)
-    print("🟢 APPROVALS:", len(approvals))
+    files = get_files(owner, name, pr_id)
 
+    print("🟢 approvals:", len(approvals))
+    print("📦 files:", files)
+
+    csproj_only = is_csproj_only(files)
+
+    # -------------------------
+    # RULE 1: <1 approval
+    # -------------------------
     if len(approvals) < 1:
-        print("⛔ No approvals → skip")
-        return {"status": "no approvals"}
+        print("⛔ No approvals")
+        return {"status": "skip"}
 
     # -------------------------
-    # FILES
+    # RULE 2: csproj only
     # -------------------------
-    files = extract_files(owner, name, pr_id)
-    print("📦 FILES:", files)
+    if csproj_only:
+        if state.get("last_comment_type") != "csproj":
+            comment(owner, name, pr_id, "📦 Изменение версий пакетов")
+            state["last_comment_type"] = "csproj"
 
-    # -------------------------
-    # CASE 1: csproj only
-    # -------------------------
-    if is_csproj_only(files):
-        comment(owner, name, pr_id, "📦 Изменение версий пакетов")
         return {"status": "csproj ok"}
 
     # -------------------------
-    # CASE 2: CODE CHANGE
+    # RULE 3: CODE CHANGE
     # -------------------------
-    comment(owner, name, pr_id, "❌ Изменение в коде. Требуется повторное ревью.")
-    add_label(owner, name, pr_id, "re-review-required")
+    if state.get("last_comment_type") != "code":
+
+        comment(
+            owner,
+            name,
+            pr_id,
+            "❌ Изменение в коде. Требуется повторное ревью. Аппрувы считаются устаревшими."
+        )
+
+        label(owner, name, pr_id, "re-review-required")
+
+        state["invalidated"] = True
+        state["last_comment_type"] = "code"
 
     return {"status": "code review required"}
