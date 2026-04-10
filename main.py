@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request
-import requests
 import os
+import requests
 
 app = FastAPI()
 
@@ -8,26 +8,46 @@ GITEA_URL = os.getenv("GITEA_URL")
 TOKEN = os.getenv("GITEA_TOKEN")
 
 
-def gitea_get(url):
-    return requests.get(
+def api(method, url, data=None):
+    return requests.request(
+        method,
         f"{GITEA_URL}{url}",
-        headers={"Authorization": f"token {TOKEN}"}
+        headers={"Authorization": f"token {TOKEN}"},
+        json=data
     ).json()
 
 
-def is_version_change_only(files):
-    allowed = (".csproj",)
+def is_csproj_only(files):
     for f in files:
-        if not f.endswith(allowed):
+        if not f.endswith(".csproj"):
             return False
     return True
+
+
+def get_approvals(owner, repo, pr_id):
+    reviews = api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/reviews")
+    return [r for r in reviews if r["state"] == "APPROVED"]
+
+
+def get_changed_files(owner, repo, pr_id):
+    commits = api("GET", f"/api/v1/repos/{owner}/{repo}/pulls/{pr_id}/files")
+    return [f["filename"] for f in commits]
+
+
+def request_review_from_codeowners(owner, repo, pr_id):
+    # упрощённо: берём codeowners файл (если есть)
+    try:
+        co = api("GET", f"/api/v1/repos/{owner}/{repo}/contents/CODEOWNERS")
+        # дальше можно парсить, но оставим минимально
+    except:
+        pass
 
 
 @app.post("/webhook")
 async def webhook(req: Request):
     payload = await req.json()
 
-    if payload.get("action") not in ["synchronized", "opened", "reopened"]:
+    if payload.get("action") not in ["opened", "synchronized", "reopened"]:
         return {"ok": True}
 
     pr = payload["pull_request"]
@@ -37,47 +57,41 @@ async def webhook(req: Request):
     name = repo["name"]
     pr_id = pr["number"]
 
-    # 1. approvals
-    reviews = gitea_get(f"/api/v1/repos/{owner}/{name}/pulls/{pr_id}/reviews")
+    approvals = get_approvals(owner, name, pr_id)
 
-    approvals = [r for r in reviews if r["state"] == "APPROVED"]
+    if len(approvals) < 1:
+        return {"status": "no approvals"}
 
-    if len(approvals) < 2:
-        return {"status": "not enough approvals"}
+    files = get_changed_files(owner, name, pr_id)
 
-    last_approval_time = max(r["submitted_at"] for r in approvals)
+    csproj_only = is_csproj_only(files)
 
-    # 2. commits after approval
-    commits = gitea_get(f"/api/v1/repos/{owner}/{name}/pulls/{pr_id}/commits")
+    # CASE 1: csproj changes
+    if csproj_only:
+        api(
+            "POST",
+            f"/api/v1/repos/{owner}/{name}/issues/{pr_id}/comments",
+            {"body": "📦 Изменение версий пакетов"}
+        )
+        return {"status": "csproj ok"}
 
-    bad_commits = [
-        c for c in commits
-        if c["created"] > last_approval_time
-    ]
-
-    if not bad_commits:
-        return {"status": "ok"}
-
-    # 3. files in those commits
-    all_files = set()
-
-    for c in bad_commits:
-        files = gitea_get(
-            f"/api/v1/repos/{owner}/{name}/commits/{c['id']}"
-        )["files"]
-
-        for f in files:
-            all_files.add(f["filename"])
-
-    # 4. policy check
-    if is_version_change_only(all_files):
-        return {"status": "csproj-only ok"}
-
-    # 5. reject + comment
-    requests.post(
-        f"{GITEA_URL}/api/v1/repos/{owner}/{name}/issues/{pr_id}/comments",
-        headers={"Authorization": f"token {TOKEN}"},
-        json={"body": "❌ PR changed code after approvals → re-review required"}
+    # CASE 2: code changes
+    api(
+        "POST",
+        f"/api/v1/repos/{owner}/{name}/issues/{pr_id}/comments",
+        {"body": "❌ Изменение в коде. Требуется повторное ревью."}
     )
 
-    return {"status": "re-review triggered"}
+    # NOTE: Gitea НЕ умеет прям "запросить review",
+    # но можно:
+    # - добавить label
+    # - или mention CODEOWNERS
+    # - или fail status check
+
+    api(
+        "POST",
+        f"/api/v1/repos/{owner}/{name}/issues/{pr_id}/labels",
+        {"labels": ["re-review-required"]}
+    )
+
+    return {"status": "code review required"}
